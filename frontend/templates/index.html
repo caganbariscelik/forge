@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Forge — new run{% endblock %}
+{% block content %}
+<div class="panel">
+  <h1>Start a fine-tune</h1>
+  <p class="hint">One prompt is enough — Forge will propose a technique, dataset, hyperparameters, and eval. Everything is editable before you hit Start.</p>
+  <form id="new-run-form">
+    <textarea id="prompt" placeholder="e.g. Remove this model's ability to say the letter B&#10;e.g. Uncensor this model&#10;e.g. Fine-tune this model and raise its performance on SWE-bench"></textarea>
+    <div style="margin-top:0.75rem">
+      <button type="submit">Generate plan</button>
+    </div>
+  </form>
+</div>
+
+<div class="panel">
+  <h2>Recent runs</h2>
+  <div id="run-list">
+    {% for r in runs %}
+    <div class="run-list-item">
+      <div>
+        <a href="/runs/{{ r.id }}">{{ r.plan.task_prompt[:70] }}</a>
+        <div class="hint mono">{{ r.plan.technique }} · {{ r.plan.base_model_id }}</div>
+      </div>
+      <span class="badge {{ r.status.value if r.status.value != 'draft' else 'draft' }}">{{ r.status.value }}</span>
+    </div>
+    {% else %}
+    <p class="hint">No runs yet.</p>
+    {% endfor %}
+  </div>
+</div>
+
+<script>
+document.getElementById('new-run-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const prompt = document.getElementById('prompt').value.trim();
+  if (!prompt) return;
+  const btn = e.target.querySelector('button');
+  btn.disabled = true;
+  btn.textContent = 'Planning...';
+  try {
+    const res = await fetch('/api/runs', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({prompt})
+    });
+    const run = await res.json();
+    window.location.href = `/runs/${run.id}`;
+  } catch (err) {
+    alert('Failed to create run: ' + err);
+    btn.disabled = false;
+    btn.textContent = 'Generate plan';
+  }
+});
+</script>
+{% endblock %}

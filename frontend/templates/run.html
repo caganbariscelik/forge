@@ -1,0 +1,298 @@
+{% extends "base.html" %}
+{% block title %}Forge — {{ run_id[:8] }}{% endblock %}
+{% block content %}
+<div class="panel">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start">
+    <div>
+      <h1 id="task-prompt">Loading...</h1>
+      <p class="hint" id="task-summary"></p>
+    </div>
+    <span class="badge" id="status-badge">-</span>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Plan <span class="hint" id="plan-lock-hint"></span></h2>
+  <p class="hint" id="technique-rationale"></p>
+  <div class="grid-2">
+    <div><label>Technique</label><select id="p-technique">
+      <option value="lora_sft">lora_sft</option>
+      <option value="abliteration">abliteration</option>
+      <option value="full_sft">full_sft</option>
+      <option value="dpo">dpo</option>
+    </select></div>
+    <div><label>Backend</label><select id="p-backend">
+      <option value="local">local</option>
+      <option value="tinker">tinker</option>
+    </select></div>
+    <div><label>Base model id (target)</label><input type="text" id="p-base-model"></div>
+    <div><label>Recommended demo model</label><input type="text" id="p-demo-model" disabled></div>
+  </div>
+
+  <h2 style="margin-top:1.25rem">Dataset</h2>
+  <div class="grid-2">
+    <div><label>Source type</label><select id="d-source">
+      <option value="letter_filter">letter_filter</option>
+      <option value="synthetic">synthetic</option>
+      <option value="hf_pull">hf_pull</option>
+      <option value="swebench_pro">swebench_pro</option>
+    </select></div>
+    <div><label>HF dataset id</label><input type="text" id="d-hfid"></div>
+    <div><label>n_train</label><input type="number" id="d-ntrain"></div>
+    <div><label>n_eval_holdout</label><input type="number" id="d-nholdout"></div>
+  </div>
+
+  <h2 style="margin-top:1.25rem">Hyperparameters</h2>
+  <div class="grid-2">
+    <div><label>LoRA r</label><input type="number" id="h-r"></div>
+    <div><label>LoRA alpha</label><input type="number" id="h-alpha"></div>
+    <div><label>Learning rate</label><input type="number" step="0.00001" id="h-lr"></div>
+    <div><label>Max steps</label><input type="number" id="h-steps"></div>
+    <div><label>Batch size</label><input type="number" id="h-bs"></div>
+    <div><label>Grad accum steps</label><input type="number" id="h-ga"></div>
+  </div>
+
+  <h2 style="margin-top:1.25rem">Eval</h2>
+  <div class="grid-2">
+    <div><label>Evaluator</label><select id="e-evaluator">
+      <option value="letter_leakage">letter_leakage</option>
+      <option value="refusal_rate">refusal_rate</option>
+      <option value="patch_similarity">patch_similarity</option>
+      <option value="perplexity">perplexity</option>
+    </select></div>
+    <div><label>Judge</label><select id="e-judge">
+      <option value="keyword">keyword</option>
+      <option value="llm_judge">llm_judge</option>
+      <option value="exact_metric">exact_metric</option>
+    </select></div>
+  </div>
+
+  <div style="margin-top:1rem">
+    <button id="save-plan-btn" onclick="savePlan()">Save changes</button>
+    <button id="start-btn" class="secondary" onclick="startRun()">Start run</button>
+    <button class="secondary" onclick="cloneRun()">Clone &amp; edit</button>
+  </div>
+</div>
+
+<div class="panel" id="dataset-preview-panel" style="display:none">
+  <h2>Dataset preview</h2>
+  <table id="dataset-table"><thead><tr><th>prompt</th><th>completion</th></tr></thead><tbody></tbody></table>
+</div>
+
+<div class="panel" id="log-panel-wrap" style="display:none">
+  <h2>Run log</h2>
+  <div id="log-panel"></div>
+  <canvas id="loss-chart" height="80" style="margin-top:0.75rem"></canvas>
+</div>
+
+<div class="panel" id="eval-panel" style="display:none">
+  <h2>Eval results (before vs after)</h2>
+  <div class="eval-compare">
+    <div>
+      <h2 style="font-size:0.9rem">Before</h2>
+      <div id="metrics-before"></div>
+    </div>
+    <div>
+      <h2 style="font-size:0.9rem">After</h2>
+      <div id="metrics-after"></div>
+    </div>
+  </div>
+  <p class="hint" id="eval-notes"></p>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+const RUN_ID = "{{ run_id }}";
+let currentRun = null;
+let evtSource = null;
+let lossChart = null;
+const lossData = {labels: [], datasets: [{label: 'loss', data: [], borderColor: '#7c9eff', tension: 0.2}]};
+
+function fmtMetric(v) {
+  if (typeof v !== 'number') return v;
+  return (Math.abs(v) < 1 && v !== 0) ? (v*100).toFixed(1) + '%' : v.toFixed(4);
+}
+
+function renderMetrics(el, evalResult) {
+  el.innerHTML = '';
+  if (!evalResult) { el.innerHTML = '<p class="hint">pending...</p>'; return; }
+  for (const [k, v] of Object.entries(evalResult.metrics)) {
+    const card = document.createElement('div');
+    card.className = 'metric-card';
+    card.style.marginBottom = '0.5rem';
+    card.innerHTML = `<div class="name">${k}</div><div class="value">${fmtMetric(v)}</div>`;
+    el.appendChild(card);
+  }
+}
+
+function fillForm(run) {
+  const p = run.plan;
+  document.getElementById('task-prompt').textContent = p.task_prompt;
+  document.getElementById('task-summary').textContent = p.task_summary || '';
+  document.getElementById('technique-rationale').textContent = p.technique_rationale || '';
+  document.getElementById('status-badge').textContent = run.status;
+  document.getElementById('status-badge').className = 'badge ' + run.status;
+
+  document.getElementById('p-technique').value = p.technique;
+  document.getElementById('p-backend').value = p.backend;
+  document.getElementById('p-base-model').value = p.base_model_id;
+  document.getElementById('p-demo-model').value = p.recommended_demo_model_id || '';
+
+  document.getElementById('d-source').value = p.dataset_spec.source_type;
+  document.getElementById('d-hfid').value = p.dataset_spec.hf_dataset_id || '';
+  document.getElementById('d-ntrain').value = p.dataset_spec.n_train;
+  document.getElementById('d-nholdout').value = p.dataset_spec.n_eval_holdout;
+
+  document.getElementById('h-r').value = p.hyperparams.lora_r ?? '';
+  document.getElementById('h-alpha').value = p.hyperparams.lora_alpha ?? '';
+  document.getElementById('h-lr').value = p.hyperparams.learning_rate;
+  document.getElementById('h-steps').value = p.hyperparams.max_steps ?? '';
+  document.getElementById('h-bs').value = p.hyperparams.per_device_batch_size;
+  document.getElementById('h-ga').value = p.hyperparams.gradient_accumulation_steps;
+
+  document.getElementById('e-evaluator').value = p.eval_spec.evaluator;
+  document.getElementById('e-judge').value = p.eval_spec.judge;
+
+  const locked = !['draft', 'dataset_ready'].includes(run.status);
+  document.getElementById('plan-lock-hint').textContent = locked ? '(locked — clone to edit)' : '';
+  document.querySelectorAll('#p-technique,#p-backend,#p-base-model,#d-source,#d-hfid,#d-ntrain,#d-nholdout,#h-r,#h-alpha,#h-lr,#h-steps,#h-bs,#h-ga,#e-evaluator,#e-judge').forEach(el => el.disabled = locked);
+  document.getElementById('save-plan-btn').disabled = locked;
+  document.getElementById('start-btn').disabled = locked;
+
+  if (p.dataset_spec.preview && p.dataset_spec.preview.length) {
+    document.getElementById('dataset-preview-panel').style.display = '';
+    const tbody = document.querySelector('#dataset-table tbody');
+    tbody.innerHTML = '';
+    p.dataset_spec.preview.slice(0, 10).forEach(ex => {
+      const tr = document.createElement('tr');
+      const p1 = (ex.prompt || '').slice(0, 80);
+      const c1 = (ex.completion || '').slice(0, 100);
+      tr.innerHTML = `<td>${p1}</td><td>${c1}</td>`;
+      tbody.appendChild(tr);
+    });
+  }
+
+  if (run.status !== 'draft') {
+    document.getElementById('log-panel-wrap').style.display = '';
+  }
+  if (run.eval_result_before || run.eval_result_after) {
+    document.getElementById('eval-panel').style.display = '';
+    renderMetrics(document.getElementById('metrics-before'), run.eval_result_before);
+    renderMetrics(document.getElementById('metrics-after'), run.eval_result_after);
+    document.getElementById('eval-notes').textContent = (run.eval_result_after && run.eval_result_after.notes) || '';
+  }
+  const logPanel = document.getElementById('log-panel');
+  if (logPanel.children.length === 0) {
+    run.logs.forEach(appendLogLine);
+  }
+}
+
+function appendLogLine(line) {
+  const panel = document.getElementById('log-panel');
+  const div = document.createElement('div');
+  div.className = 'line ' + (line.level || 'info');
+  div.textContent = `[${(line.ts || '').slice(11,19)}] ${line.message}`;
+  panel.appendChild(div);
+  panel.scrollTop = panel.scrollHeight;
+  if (line.data && typeof line.data.loss === 'number' && typeof line.data.step === 'number') {
+    lossData.labels.push(line.data.step);
+    lossData.datasets[0].data.push(line.data.loss);
+    if (lossChart) lossChart.update();
+  }
+}
+
+async function fetchRun() {
+  const res = await fetch(`/api/runs/${RUN_ID}`);
+  currentRun = await res.json();
+  fillForm(currentRun);
+  return currentRun;
+}
+
+function collectPatch() {
+  return {
+    technique: document.getElementById('p-technique').value,
+    backend: document.getElementById('p-backend').value,
+    base_model_id: document.getElementById('p-base-model').value,
+    dataset_spec: {
+      ...currentRun.plan.dataset_spec,
+      source_type: document.getElementById('d-source').value,
+      hf_dataset_id: document.getElementById('d-hfid').value || null,
+      n_train: parseInt(document.getElementById('d-ntrain').value),
+      n_eval_holdout: parseInt(document.getElementById('d-nholdout').value),
+    },
+    hyperparams: {
+      ...currentRun.plan.hyperparams,
+      lora_r: parseInt(document.getElementById('h-r').value) || null,
+      lora_alpha: parseInt(document.getElementById('h-alpha').value) || null,
+      learning_rate: parseFloat(document.getElementById('h-lr').value),
+      max_steps: parseInt(document.getElementById('h-steps').value) || null,
+      per_device_batch_size: parseInt(document.getElementById('h-bs').value),
+      gradient_accumulation_steps: parseInt(document.getElementById('h-ga').value),
+    },
+    eval_spec: {
+      ...currentRun.plan.eval_spec,
+      evaluator: document.getElementById('e-evaluator').value,
+      judge: document.getElementById('e-judge').value,
+    },
+  };
+}
+
+async function savePlan() {
+  const patch = collectPatch();
+  const res = await fetch(`/api/runs/${RUN_ID}/plan`, {
+    method: 'PATCH', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({patch})
+  });
+  if (!res.ok) { alert('Save failed: ' + await res.text()); return; }
+  currentRun = await res.json();
+  fillForm(currentRun);
+}
+
+async function startRun() {
+  await savePlan();
+  const res = await fetch(`/api/runs/${RUN_ID}/start`, {method: 'POST'});
+  if (!res.ok) { alert('Start failed: ' + await res.text()); return; }
+  document.getElementById('log-panel-wrap').style.display = '';
+  connectStream();
+  pollStatus();
+}
+
+async function cloneRun() {
+  const res = await fetch(`/api/runs/${RUN_ID}/clone`, {method: 'POST'});
+  const clone = await res.json();
+  window.location.href = `/runs/${clone.id}`;
+}
+
+function connectStream() {
+  if (evtSource) evtSource.close();
+  evtSource = new EventSource(`/api/runs/${RUN_ID}/logs`);
+  evtSource.addEventListener('log', (e) => {
+    const data = JSON.parse(e.data);
+    appendLogLine({ts: data.ts, level: data.level, message: data.message, data: data.data});
+  });
+  evtSource.addEventListener('done', () => {
+    evtSource.close();
+    fetchRun();
+  });
+}
+
+let pollTimer = null;
+function pollStatus() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    const run = await fetchRun();
+    if (['complete', 'failed'].includes(run.status)) clearInterval(pollTimer);
+  }, 3000);
+}
+
+(async function init() {
+  const ctx = document.getElementById('loss-chart').getContext('2d');
+  lossChart = new Chart(ctx, {type: 'line', data: lossData, options: {scales: {y: {beginAtZero: false}}, plugins: {legend: {display: false}}}});
+  const run = await fetchRun();
+  if (['training', 'training_done', 'evaluating'].includes(run.status)) {
+    connectStream();
+    pollStatus();
+  }
+})();
+</script>
+{% endblock %}
